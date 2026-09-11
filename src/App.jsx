@@ -5,12 +5,19 @@ import {
   LayoutGrid, Send, Users, Info, Gift, Search, Heart, Link2,
   Camera, Check, Clock, ImageOff
 } from "lucide-react";
+import { createClient } from "@supabase/supabase-js";
 
 /* ---------------------------------------------------------
    OLD HABITS — black, tab-based loyalty + shop app
    Tabs: Home / Shop / Points / Profile (+ Manage Store, admin)
-   Data persists via window.storage (shared across visitors).
+   Data persists via Supabase (a real shared database).
 --------------------------------------------------------- */
+
+
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY
+);
 
 const FONT_LINK_ID = "old-habits-fonts";
 function useFonts() {
@@ -71,11 +78,124 @@ function getTierInfo(spend) {
 }
 function currency(n) { return `$${n.toFixed(2)}`; }
 
-async function storageGet(key, shared = true) {
-  try { const res = await window.storage.get(key, shared); return res ? JSON.parse(res.value) : null; } catch { return null; }
+async function storageGet(key) {
+  try {
+    const { data, error } = await supabase.from("app_storage").select("value").eq("key", key).maybeSingle();
+    if (error) throw error;
+    return data ? data.value : null;
+  } catch (e) {
+    console.error("storageGet failed for", key, e);
+    return null;
+  }
 }
-async function storageSet(key, value, shared = true) {
-  try { await window.storage.set(key, JSON.stringify(value), shared); } catch (e) { console.error(e); }
+async function storageSet(key, value) {
+  try {
+    const { error } = await supabase.from("app_storage").upsert({ key, value, updated_at: new Date().toISOString() });
+    if (error) throw error;
+  } catch (e) {
+    console.error("storageSet failed for", key, e);
+  }
+}
+
+// --- Customers, orders, and trade-ins live in their own real database tables,
+// one row per record, so two people acting at the same time can never overwrite
+// each other's data the way a single shared blob could. ---
+
+function customerToRow(c) {
+  return {
+    phone: c.phone, name: c.name, points: c.points,
+    store_credit: c.storeCredit || 0, lifetime_spend: c.lifetimeSpend || 0,
+    milestones_reached: c.milestonesReached || [],
+    card_issued: c.cardIssued, card_last4: c.cardLast4, account_number: c.accountNumber,
+  };
+}
+function rowToCustomer(r) {
+  return {
+    phone: r.phone, name: r.name, points: r.points,
+    storeCredit: Number(r.store_credit) || 0, lifetimeSpend: Number(r.lifetime_spend) || 0,
+    milestonesReached: r.milestones_reached || [],
+    cardIssued: r.card_issued, cardLast4: r.card_last4, accountNumber: r.account_number,
+  };
+}
+async function fetchAllCustomers() {
+  try {
+    const { data, error } = await supabase.from("customers").select("*");
+    if (error) throw error;
+    const obj = {};
+    (data || []).forEach((row) => { obj[row.phone] = rowToCustomer(row); });
+    return obj;
+  } catch (e) { console.error("fetchAllCustomers failed", e); return {}; }
+}
+async function upsertCustomerRow(c) {
+  try {
+    const { error } = await supabase.from("customers").upsert(customerToRow(c));
+    if (error) throw error;
+    return { ok: true };
+  } catch (e) {
+    console.error("upsertCustomerRow failed", e);
+    return { ok: false, message: e.message || String(e) };
+  }
+}
+
+function orderToRow(o) {
+  return {
+    id: o.id, phone: o.phone, customer_name: o.customerName, items: o.items, subtotal: o.subtotal,
+    points_credit_applied: o.pointsCreditApplied, store_credit_applied: o.storeCreditApplied, total: o.total,
+    points_redeemed: o.pointsRedeemed, points_earned: o.pointsEarned, date: o.date,
+  };
+}
+function rowToOrder(r) {
+  return {
+    id: r.id, phone: r.phone, customerName: r.customer_name, items: r.items, subtotal: Number(r.subtotal),
+    pointsCreditApplied: Number(r.points_credit_applied) || 0, storeCreditApplied: Number(r.store_credit_applied) || 0,
+    total: Number(r.total), pointsRedeemed: r.points_redeemed, pointsEarned: r.points_earned, date: r.date,
+  };
+}
+async function fetchAllOrders() {
+  try {
+    const { data, error } = await supabase.from("orders").select("*").order("date", { ascending: false });
+    if (error) throw error;
+    return (data || []).map(rowToOrder);
+  } catch (e) { console.error("fetchAllOrders failed", e); return []; }
+}
+async function insertOrderRow(o) {
+  try { const { error } = await supabase.from("orders").insert(orderToRow(o)); if (error) throw error; }
+  catch (e) { console.error("insertOrderRow failed", e); }
+}
+
+function tradeInToRow(t) {
+  return {
+    id: t.id, phone: t.phone, customer_name: t.customerName, status: t.status, offered_credit: t.offeredCredit,
+    photos: t.photos, item_name: t.itemName, brand: t.brand, size: t.size, condition: t.condition,
+    description: t.description, date: t.date,
+  };
+}
+function rowToTradeIn(r) {
+  return {
+    id: r.id, phone: r.phone, customerName: r.customer_name, status: r.status, offeredCredit: r.offered_credit,
+    photos: r.photos || [], itemName: r.item_name, brand: r.brand, size: r.size, condition: r.condition,
+    description: r.description, date: r.date,
+  };
+}
+async function fetchAllTradeIns() {
+  try {
+    const { data, error } = await supabase.from("trade_ins").select("*").order("date", { ascending: false });
+    if (error) throw error;
+    return (data || []).map(rowToTradeIn);
+  } catch (e) { console.error("fetchAllTradeIns failed", e); return []; }
+}
+async function insertTradeInRow(t) {
+  try { const { error } = await supabase.from("trade_ins").insert(tradeInToRow(t)); if (error) throw error; }
+  catch (e) { console.error("insertTradeInRow failed", e); }
+}
+async function updateTradeInRow(id, updates) {
+  try {
+    const patch = {};
+    if ("status" in updates) patch.status = updates.status;
+    if ("offeredCredit" in updates) patch.offered_credit = updates.offeredCredit;
+    const { error } = await supabase.from("trade_ins").update(patch).eq("id", id);
+    if (error) throw error;
+  } catch (e) { console.error("updateTradeInRow failed", e); }
 }
 
 const ADMIN_PASSWORD_HASH = "6d0c8bc10e5c2b1f71afb42c3ed46ed2b417b85474e0da7a63d424d05cb378e9";
@@ -110,18 +230,19 @@ export default function App() {
   const [useStoreCredit, setUseStoreCredit] = useState(false);
   const [activeProduct, setActiveProduct] = useState(null);
   const [toast, setToast] = useState(null);
+  const [syncError, setSyncError] = useState(null);
 
   useEffect(() => {
     (async () => {
       const [p, o, s, n, cust, ord, link, trades] = await Promise.all([
         storageGet("oh:products"), storageGet("oh:offers"), storageGet("oh:subscribers"),
-        storageGet("oh:newsletters"), storageGet("oh:customers"), storageGet("oh:orders"), storageGet("oh:squareLink"),
-        storageGet("oh:tradeins"),
+        storageGet("oh:newsletters"), fetchAllCustomers(), fetchAllOrders(), storageGet("oh:squareLink"),
+        fetchAllTradeIns(),
       ]);
       if (p) setProducts(p); if (o) setOffers(o); if (s) setSubscribers(s);
-      if (n) setSentNewsletters(n); if (cust) setCustomers(cust); if (ord) setOrders(ord);
+      if (n) setSentNewsletters(n); setCustomers(cust); setOrders(ord);
       if (link) setSquarePaymentLink(link);
-      if (trades) setTradeIns(trades);
+      setTradeIns(trades);
       setLoaded(true);
     })();
   }, []);
@@ -129,29 +250,38 @@ export default function App() {
   useEffect(() => { if (loaded) storageSet("oh:offers", offers); }, [offers, loaded]);
   useEffect(() => { if (loaded) storageSet("oh:subscribers", subscribers); }, [subscribers, loaded]);
   useEffect(() => { if (loaded) storageSet("oh:newsletters", sentNewsletters); }, [sentNewsletters, loaded]);
-  useEffect(() => { if (loaded) storageSet("oh:customers", customers); }, [customers, loaded]);
-  useEffect(() => { if (loaded) storageSet("oh:orders", orders); }, [orders, loaded]);
   useEffect(() => { if (loaded) storageSet("oh:squareLink", squarePaymentLink); }, [squarePaymentLink, loaded]);
-  useEffect(() => { if (loaded) storageSet("oh:tradeins", tradeIns); }, [tradeIns, loaded]);
 
   const customer = currentPhone ? customers[currentPhone] : null;
 
-  function enrollOrLogin(name, phone) {
-    let isNew = false;
-    let newAccountNumber = "";
-    setCustomers((cs) => {
-      if (cs[phone]) return cs; // already exists, just log them in
-      isNew = true;
-      const cardLast4 = String(Math.floor(1000 + Math.random() * 9000));
-      newAccountNumber = `OH-${String(Object.keys(cs).length + 1).padStart(5, "0")}`;
-      return { ...cs, [phone]: { name, phone, points: 0, storeCredit: 0, lifetimeSpend: 0, milestonesReached: [], cardIssued: true, cardLast4, accountNumber: newAccountNumber } };
-    });
+  async function enrollOrLogin(name, phone) {
+    if (customers[phone]) {
+      setCurrentPhone(phone); // already exists, just log them in
+      return;
+    }
+    const cardLast4 = String(Math.floor(1000 + Math.random() * 9000));
+    // Random rather than sequential, so two people signing up at the same instant can't collide.
+    const accountNumber = `OH-${String(Math.floor(100000 + Math.random() * 900000))}`;
+    const newCustomer = { name, phone, points: 0, storeCredit: 0, lifetimeSpend: 0, milestonesReached: [], cardIssued: true, cardLast4, accountNumber };
+    setCustomers((cs) => ({ ...cs, [phone]: newCustomer }));
     setCurrentPhone(phone);
-    if (isNew) showToast(`Welcome! Your account number is ${newAccountNumber}`);
+    showToast(`Welcome! Your account number is ${accountNumber}`);
+    const result = await upsertCustomerRow(newCustomer);
+    if (!result.ok) {
+      setSyncError(`Couldn't save your account to the database: ${result.message}`);
+    }
   }
 
-  function updateCustomerPoints(phone, deltaFn) {
-    setCustomers((cs) => (cs[phone] ? { ...cs, [phone]: { ...cs[phone], points: Math.max(0, deltaFn(cs[phone].points)) } } : cs));
+  // Updates one customer both in local state and in their own database row.
+  function updateCustomer(phone, updaterFn) {
+    let updated = null;
+    setCustomers((cs) => {
+      if (!cs[phone]) return cs;
+      updated = updaterFn(cs[phone]);
+      return { ...cs, [phone]: updated };
+    });
+    if (updated) upsertCustomerRow(updated);
+    return updated;
   }
 
   // Adjusts points, store credit, and lifetime spend on one customer in a single update (used at checkout).
@@ -159,9 +289,7 @@ export default function App() {
   // Returns the milestone that was just unlocked (if any) so the UI can announce it.
   function applyOrderToCustomer(phone, pointsDelta, creditDelta, spendAmount) {
     let unlocked = null;
-    setCustomers((cs) => {
-      if (!cs[phone]) return cs;
-      const c = cs[phone];
+    updateCustomer(phone, (c) => {
       const newLifetimeSpend = +(((c.lifetimeSpend || 0) + spendAmount).toFixed(2));
       const reached = c.milestonesReached || [];
       const newlyReached = [...reached];
@@ -174,14 +302,11 @@ export default function App() {
         }
       });
       return {
-        ...cs,
-        [phone]: {
-          ...c,
-          points: Math.max(0, c.points + pointsDelta),
-          storeCredit: Math.max(0, +(((c.storeCredit || 0) + creditDelta + bonusCredit).toFixed(2))),
-          lifetimeSpend: newLifetimeSpend,
-          milestonesReached: newlyReached,
-        },
+        ...c,
+        points: Math.max(0, c.points + pointsDelta),
+        storeCredit: Math.max(0, +(((c.storeCredit || 0) + creditDelta + bonusCredit).toFixed(2))),
+        lifetimeSpend: newLifetimeSpend,
+        milestonesReached: newlyReached,
       };
     });
     return unlocked;
@@ -198,6 +323,7 @@ export default function App() {
       ...details,
     };
     setTradeIns((t) => [request, ...t]);
+    insertTradeInRow(request);
     showToast("Trade-in request sent — we'll review it soon");
   }
 
@@ -208,14 +334,11 @@ export default function App() {
         return { ...t, status: approve ? "approved" : "declined", offeredCredit: approve ? amount : null };
       })
     );
+    updateTradeInRow(id, { status: approve ? "approved" : "declined", offeredCredit: approve ? amount : null });
     if (approve) {
       const req = tradeIns.find((t) => t.id === id);
       if (req) {
-        setCustomers((cs) =>
-          cs[req.phone]
-            ? { ...cs, [req.phone]: { ...cs[req.phone], storeCredit: +(((cs[req.phone].storeCredit || 0) + amount).toFixed(2)) } }
-            : cs
-        );
+        updateCustomer(req.phone, (c) => ({ ...c, storeCredit: +(((c.storeCredit || 0) + amount).toFixed(2)) }));
       }
     }
   }
@@ -255,6 +378,7 @@ export default function App() {
       pointsCreditApplied, storeCreditApplied, total, pointsRedeemed, pointsEarned, date: new Date().toISOString(),
     };
     setOrders((o) => [order, ...o]);
+    insertOrderRow(order);
     const unlocked = applyOrderToCustomer(customer.phone, pointsEarned - pointsRedeemed, -storeCreditApplied, subtotal);
     setCart([]); setUseCredit(false); setUseStoreCredit(false); setCartOpen(false);
     if (unlocked) {
@@ -295,6 +419,13 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {syncError && (
+        <div style={{ background: "#5A1A14", color: "#FFD9CE", padding: "14px 18px", fontSize: 13.5, lineHeight: 1.5, display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
+          <div><strong>Something didn't save.</strong> {syncError}</div>
+          <button onClick={() => setSyncError(null)} style={{ background: "none", border: "none", color: "#FFD9CE", cursor: "pointer", flexShrink: 0 }}><X size={16} /></button>
+        </div>
+      )}
 
       {section === "customer" ? (
         !customer ? (
@@ -1140,7 +1271,9 @@ function CustomersTab({ customers, setCustomers, showToast }) {
     const n = parseInt(amount, 10);
     if (!n || n <= 0) return showToast("Enter a points amount");
     if (!selected) return showToast("Select a customer first");
-    setCustomers((cs) => ({ ...cs, [selected.phone]: { ...cs[selected.phone], points: Math.max(0, cs[selected.phone].points + sign * n) } }));
+    const updated = { ...selected, points: Math.max(0, selected.points + sign * n) };
+    setCustomers((cs) => ({ ...cs, [selected.phone]: updated }));
+    upsertCustomerRow(updated);
     setAmount(""); showToast(sign > 0 ? "Points added" : "Points deducted");
   }
 
@@ -1148,10 +1281,9 @@ function CustomersTab({ customers, setCustomers, showToast }) {
     const n = parseFloat(creditAmount);
     if (!n || n <= 0) return showToast("Enter a dollar amount");
     if (!selected) return showToast("Select a customer first");
-    setCustomers((cs) => ({
-      ...cs,
-      [selected.phone]: { ...cs[selected.phone], storeCredit: Math.max(0, +(((cs[selected.phone].storeCredit || 0) + sign * n).toFixed(2))) },
-    }));
+    const updated = { ...selected, storeCredit: Math.max(0, +(((selected.storeCredit || 0) + sign * n).toFixed(2))) };
+    setCustomers((cs) => ({ ...cs, [selected.phone]: updated }));
+    upsertCustomerRow(updated);
     setCreditAmount(""); showToast(sign > 0 ? "Store credit added" : "Store credit deducted");
   }
 
@@ -1161,10 +1293,10 @@ function CustomersTab({ customers, setCustomers, showToast }) {
     if (!newName.trim() || digits.length < 7) return showToast("Enter a name and valid phone number");
     if (customers[digits]) return showToast("A customer with that phone already exists");
     const cardLast4 = String(Math.floor(1000 + Math.random() * 9000));
-    setCustomers((cs) => {
-      const accountNumber = `OH-${String(Object.keys(cs).length + 1).padStart(5, "0")}`;
-      return { ...cs, [digits]: { name: newName.trim(), phone: digits, points: 0, storeCredit: 0, lifetimeSpend: 0, milestonesReached: [], cardIssued: true, cardLast4, accountNumber } };
-    });
+    const accountNumber = `OH-${String(Math.floor(100000 + Math.random() * 900000))}`;
+    const newCustomer = { name: newName.trim(), phone: digits, points: 0, storeCredit: 0, lifetimeSpend: 0, milestonesReached: [], cardIssued: true, cardLast4, accountNumber };
+    setCustomers((cs) => ({ ...cs, [digits]: newCustomer }));
+    upsertCustomerRow(newCustomer);
     setSelectedPhone(digits);
     setNewName(""); setNewPhone("");
     showToast("Customer added");
